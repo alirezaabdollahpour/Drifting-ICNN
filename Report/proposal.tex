@@ -1,0 +1,325 @@
+\documentclass[10pt,conference,compsocconf]{IEEEtran}
+
+\usepackage[colorlinks=true,citecolor=blue,linkcolor=blue,urlcolor=blue]{hyperref}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\newcommand{\citet}[2]{\textcolor{blue}{#1}~\cite{#2}}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\KL}{\mathrm{KL}}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  breaklines=true,
+  frame=single,
+  language=Python
+}
+
+\begin{document}
+\title{Convex-Potential Drift Fields: Replacing Kernels with Input Convex Neural Networks in Drifting Generative Models}
+
+
+\author{
+  Quentin Chappuis (339517), Johan I. A. Bordet (356443), \\
+  Satyam Chauhan (347037), Alireza Abdollahpoorrostam (380830) \\[1ex]
+  \textit{CS-503 Project Proposal}
+}
+
+\maketitle
+
+\begin{abstract}
+Drifting generative models learn a \emph{one-step} generator by evolving its pushforward distribution at training time via a cross-minus-self drift field.
+The original kernel-based formulation suffers from acute sensitivity to the temperature hyperparameter and an identifiability gap: vanishing drift does not guarantee that the model distribution matches the data.
+Sinkhorn-drifting partially resolves these issues through doubly-stochastic normalization, but inherits the $O(n^2)$ per-batch cost of Sinkhorn iterations and still defines the drift only at observed sample locations.
+We propose to replace the kernel-based drift field with the gradient of an Input Convex Neural Network (ICNN), yielding a displacement $V(x) = \nabla\psi_\omega(x) - x$~(i.e., the gradient of a learned convex potential $\psi_\omega$ minus the identity) that is globally defined, monotone by construction, and consistent with \textcolor{blue}{Brenier}'s theorem for optimal transport maps.
+An inner-loop regression of the ICNN against Sinkhorn soft-assignments amortizes the transport computation into a smooth, continuous potential that generalizes beyond the training batch.
+We outline a proof-of-concept on two-dimensional distributions and a plan for scaling to latent-space image generation, aiming to demonstrate improved temperature robustness, faster convergence, and stronger theoretical identifiability guarantees relative to both the original drifting and Sinkhorn-drifting baselines. \looseness=-1
+\end{abstract}
+
+
+\section{Introduction}
+
+One-step generative models are attractive because they produce samples in a single forward pass, avoiding the iterative inference required by diffusion~\cite{ho2020denoising,song2021score} and flow-matching~\cite{lipman2022flow} methods.
+\citet{Deng et al.}{deng2026drifting} recently introduced \emph{drifting models}, which evolve the generator's pushforward distribution $q = f_\theta{}_\#\, p_\varepsilon$ (i.e., the image of a prior $p_\varepsilon$ under the generator $f_\theta$) during training via a velocity field $V_{q,p}(x) = V_p^+(x) - V_q^-(x)$, where $V_p^+$ attracts each sample toward the data distribution $p$ and $V_q^-$ repels it from the current model $q$.
+Here $V_p^+$ attracts each generated sample $x$ toward the data distribution $p$ while $V_q^-$ repels it from the current model $q$, both computed as kernel-weighted mean-shift vectors.
+At equilibrium $V \equiv 0$, the distributions are expected to match, and the training loss $\|V\|^2$ is minimized.
+On ImageNet $256\!\times\!256$, this paradigm achieves state-of-the-art one-step FID of $1.54$. \looseness=-1
+
+Despite this empirical success, two fundamental issues remain.
+First, the kernel $k(x,y)=\exp(-\|x-y\|/\tau)$ introduces a temperature parameter $\tau$ to which performance is highly sensitive: at small $\tau$, each sample couples only to its nearest neighbor, collapsing the repulsive term and causing mode collapse.
+Second, the converse implication $V \equiv 0 \Rightarrow q = p$ is not guaranteed in general; the identifiability argument in~\cite{deng2026drifting} relies on a linear-independence assumption that can fail for specific kernel and particle configurations. \looseness=-1
+
+\citet{He et al.}{he2026sinkhorn} partially address both problems by connecting the drift field to the Wasserstein gradient flow of the Sinkhorn divergence $S_\tau(p,q)$.
+Replacing one-sided row-normalization with full Sinkhorn (doubly-stochastic) scaling yields an entropic optimal transport coupling that enforces both marginal constraints, restoring identifiability via the definiteness of $S_\tau$ and significantly reducing temperature sensitivity.
+However, Sinkhorn drifting still (i) requires $O(n^2 T)$ computation per batch for $T$ Sinkhorn iterations on $n$ particles, (ii) defines the drift field only at the observed particle locations rather than as a continuous function, and (iii) does not directly produce a valid optimal transport \emph{map}. \looseness=-1
+
+
+\subsection{Problem Statement}
+
+We address the following question: Can we replace the kernel-based or Sinkhorn-based drift field with a \emph{parametric}, globally-defined optimal transport map that eliminates temperature sensitivity, guarantees identifiability, and amortizes the per-batch transport computation? \looseness=-1
+
+Concretely, we propose to parameterize the drift field as the gradient of an Input Convex Neural Network (ICNN)~\cite{amos2017input}:
+\begin{equation}\label{eq:icnn_drift}
+  V_\omega(x) \;=\; \nabla_x \psi_\omega(x) \;-\; x,
+\end{equation}
+where $\psi_\omega : \R^d \to \R$ is a convex function represented by an ICNN with parameters $\omega$.
+By \citet{Brenier}{brenier1991polar}'s theorem, the gradient of a convex function is the unique optimal transport map (in the $L^2$ sense) pushing $q$ to $p$, provided the source measure is absolutely continuous.
+The map $T(x) = \nabla\psi_\omega(x)$ is therefore monotone by construction, which is a structural guarantee that kernel-based approaches lack. \looseness=-1
+
+\subsection{Key Contributions}
+
+The proposed project aims to make the following contributions:
+
+\textbf{(C1) ICNN-parameterized drift field.}
+We replace the non-parametric kernel drift with the gradient of a learned convex potential, yielding a continuous, globally-defined transport map that is valid beyond the training batch. \looseness=-1
+
+\textbf{(C2) Temperature-free formulation.}
+Since the ICNN directly approximates the Monge map $T = \nabla\psi$ rather than constructing soft couplings from a Gibbs kernel, the temperature parameter $\tau$ is eliminated from the drift computation entirely. \looseness=-1
+
+\textbf{(C3) Stronger identifiability.}
+When $\nabla\psi_\omega(x) = x$ for $q$-a.e.\ $x$, the transport map is the identity, which implies $q = p$ under standard regularity conditions.
+This closes the identifiability gap without requiring linear-independence assumptions on bilinear interaction vectors. \looseness=-1
+
+\textbf{(C4) Amortized transport.}
+The ICNN's inner-loop training on Sinkhorn soft-assignments amortizes the discrete OT computation into a smooth network that generalizes to unseen points, enabling evaluation at arbitrary locations without recomputing pairwise distances. \looseness=-1
+
+
+\section{Method and Deliveries}
+
+\subsection{Background: Drift Field and Sinkhorn Divergence}
+
+Let $p$ denote the data distribution and $q = (f_\theta)_\# p_\varepsilon$ the model distribution for generator $f_\theta$.
+The original drift field~\cite{deng2026drifting} at a generated sample $x_i$ is
+\begin{equation}\label{eq:drift_original}
+  V_{q,p}^{\text{drift}}(x_i) = \sum_{j=1}^n P_{XY}^{\text{drift}}[i,j]\, y_j - \sum_{j=1}^n P_{XX}^{\text{drift}}[i,j]\, x_j,
+\end{equation}
+where $P_{XY}^{\text{drift}}[i,j] = k(x_i, y_j) / \sum_l k(x_i, y_l)$ is a row-stochastic coupling obtained by softmax normalization of the Gibbs kernel, and $P_{XX}^{\text{drift}}$ is defined analogously for the self-interaction term. \looseness=-1
+
+\citet{He et al.}{he2026sinkhorn} show that this is a single Sinkhorn iteration ($\ell=1$) of the Wasserstein gradient flow of the Sinkhorn divergence.
+Replacing $P^{\text{drift}}$ with the converged Sinkhorn plan $\pi^\infty$ yields
+\begin{equation}\label{eq:drift_sinkhorn}
+  V_{q,p}^{\infty}(x_i) = \sum_j (n\pi_{XY}^\infty)_{ij}\, y_j - \sum_j (n\pi_{XX}^\infty)_{ij}\, x_j,
+\end{equation}
+which is precisely the particle-level Wasserstein gradient flow of $S_\tau(p,q)$ under quadratic cost $c(x,y) = \tfrac{1}{2}\|x - y\|^2$. \looseness=-1
+
+
+\subsection{Proposed Approach: ICNN Drift Fields}
+
+We propose to replace the coupling-based drift with an ICNN-parameterized optimal transport map. The approach consists of three components. \looseness=-1
+
+\subsubsection{Convex Potential via ICNN}
+
+An ICNN $\psi_\omega : \R^d \to \R$ is a neural network whose architecture enforces convexity of the output with respect to the input~\cite{amos2017input}.
+This is achieved by constraining the weights of hidden-to-hidden layers to be non-negative and using convex, non-decreasing activation functions (e.g., softplus).
+Concretely, with $L$ hidden layers:
+\begin{align}
+  h_0 &= \sigma(W_0^{(z)} x + b_0), \nonumber\\
+  h_\ell &= \sigma\!\bigl(\underbrace{W_\ell^{(y)} h_{\ell-1}}_{\geq 0 \text{ weights}} + W_\ell^{(z)} x + b_\ell\bigr), \quad \ell = 1,\ldots,L\!-\!1, \nonumber\\
+  \psi_\omega(x) &= \tfrac{\mu}{2}\|x\|^2 + W_L^{(y)} h_{L-1} + w^{(z)\top}\! x + b_L,
+\end{align}
+where $W_\ell^{(y)} \geq 0$ elementwise and $\mu > 0$ ensures $\mu$-strong convexity.
+The gradient $\nabla_x \psi_\omega(x)$ is computed via automatic differentiation and defines the transport map $T_\omega(x) = \nabla_x \psi_\omega(x)$. \looseness=-1
+
+\subsubsection{Inner-Loop Training via Sinkhorn Targets}
+
+At each outer training step, we solve a discrete entropic OT problem to obtain soft-assignment targets for the ICNN.
+Given a batch of generated samples $X = \{x_i\}_{i=1}^n$ and data samples $Y = \{y_j\}_{j=1}^n$:
+
+\begin{enumerate}
+\item Compute the cost matrix $C_{ij} = \|x_i - y_j\|^2$ and solve the Sinkhorn problem to obtain the coupling $\pi^\star$.
+\item Row-normalize to get barycentric targets: $\bar{y}_i = \sum_j \frac{\pi^\star_{ij}}{\sum_k \pi^\star_{ik}} y_j$.
+\item Run $K$ gradient steps on $\omega$ to minimize the regression loss
+\begin{equation}\label{eq:inner_loss}
+  \mathcal{L}_{\text{inner}}(\omega) = \frac{1}{n}\sum_{i=1}^n \bigl\|\nabla_x \psi_\omega(x_i) - \bar{y}_i\bigr\|^2.
+\end{equation}
+\item Project weights $W_\ell^{(y)} \leftarrow \max(W_\ell^{(y)}, 0)$ to maintain convexity.
+\end{enumerate}
+
+The ICNN drift field is then
+\begin{equation}\label{eq:V_icnn}
+  V_\omega(x_i) = \nabla_x \psi_\omega(x_i) - x_i = T_\omega(x_i) - x_i.
+\end{equation}
+
+\subsubsection{Outer-Loop Generator Training}
+
+The generator $f_\theta$ is trained with the same stop-gradient regression loss as in~\cite{deng2026drifting}:
+\begin{equation}\label{eq:outer_loss}
+  \mathcal{L}(\theta) = \E_{\varepsilon \sim p_\varepsilon}\bigl[\bigl\|f_\theta(\varepsilon) - \mathrm{sg}\bigl(f_\theta(\varepsilon) + V_\omega(f_\theta(\varepsilon))\bigr)\bigr\|^2\bigr],
+\end{equation}
+where $\mathrm{sg}(\cdot)$ denotes the stop-gradient operator.
+Because $V_\omega$ is defined by a smooth network rather than a batch-specific coupling, gradients through the loss are well-behaved even when the batch changes.
+
+\begin{algorithm}[t]
+\caption{ICNN-Drifting Training Step}
+\label{alg:icnn_drift}
+\begin{algorithmic}[1]
+\Require Generator $f_\theta$, ICNN $\psi_\omega$, data distribution $p$, prior $p_\varepsilon$
+\State Sample $\varepsilon^{1:n} \sim p_\varepsilon$, \; $y^{1:n} \sim p$
+\State $x_i \leftarrow f_\theta(\varepsilon^i)$ for $i = 1,\ldots,n$
+\State $C_{ij} \leftarrow \|x_i - y_j\|^2$
+\State $\pi^\star \leftarrow \textsc{Sinkhorn}(C, \text{reg})$
+\State $\bar{y}_i \leftarrow \sum_j \frac{\pi^\star_{ij}}{\sum_k \pi^\star_{ik}} y_j$ \hfill (barycentric targets)
+\For{$k = 1, \ldots, K$} \hfill (inner loop)
+  \State $\omega \leftarrow \omega - \eta_{\text{in}} \nabla_\omega \frac{1}{n}\sum_i \|\nabla_x \psi_\omega(x_i) - \bar{y}_i\|^2$
+  \State Project $W^{(y)}_\ell \leftarrow \max(W^{(y)}_\ell, 0)$
+\EndFor
+\State $V_i \leftarrow \nabla_x \psi_\omega(x_i) - x_i$ \hfill (ICNN drift)
+\State $\theta \leftarrow \theta - \eta \nabla_\theta \frac{1}{n}\sum_i \|f_\theta(\varepsilon^i) - \mathrm{sg}(x_i + V_i)\|^2$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Theoretical Motivation}
+
+\begin{proposition}[Identifiability]\label{prop:ident}
+Let $p, q \in \mathcal{P}_2(\R^d)$ with $q$ absolutely continuous, and let $\psi^\star$ be the \textcolor{blue}{Brenier} potential such that $(\nabla\psi^\star)_\# q = p$.
+If $V(x) = \nabla\psi^\star(x) - x = 0$ for $q$-a.e.\ $x$, then $\nabla\psi^\star = \mathrm{id}$, hence $p = q$.
+\end{proposition}
+This follows directly from the uniqueness of the \textcolor{blue}{Brenier} map~\cite{brenier1991polar,villani2009optimal}: if the optimal transport map is the identity, the two measures coincide.
+Unlike the kernel-based identifiability argument in~\cite{deng2026drifting}, which requires a non-degeneracy assumption on bilinear interaction vectors, and the Sinkhorn argument in~\cite{he2026sinkhorn}, which for finite particles at $\tau > 0$ is only proven for $n = 2$, the \textcolor{blue}{Brenier}-based statement holds under the mild condition that $q$ is absolutely continuous.
+
+\begin{remark}[Connection to Wasserstein gradient flows]
+The displacement $V(x) = T(x) - x$ where $T = \nabla\psi$ is the Monge map can be interpreted as a Wasserstein gradient flow step for the functional $\mathcal{F}(q) = W_2^2(q, p)/2$.
+The ICNN thus directly targets the $W_2$ gradient flow, whereas the Sinkhorn drift targets the $S_\tau$ gradient flow.
+As $\tau \to 0$, the Sinkhorn divergence converges to the Wasserstein distance, so our approach can be viewed as operating in the $\tau = 0$ limit, which is precisely the regime where kernel-based methods fail catastrophically.
+\end{remark}
+
+
+\subsection{Comparison of Drift Field Formulations}
+
+Table~\ref{tab:comparison} summarizes the structural differences between the three drift field formulations.
+
+\begin{table}[t]
+\centering
+\caption{Comparison of drift field formulations.}
+\label{tab:comparison}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Property & Kernel & Sinkhorn & ICNN (Ours) \\
+\midrule
+Normalization & one-sided & two-sided & N/A \\
+Temperature $\tau$ & required & required & eliminated \\
+Defined beyond batch & no & no & yes \\
+Monotone map & no & no & yes \\
+Identifiability & conditional & partial & full \\
+Per-batch cost & $O(n^2)$ & $O(n^2 T)$ & $O(nK\cdot\text{ICNN})$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{How Will We Validate the Solution?}
+
+We plan the following quantitative and qualitative evaluations:
+
+\textbf{Quantitative metrics.}
+On 2D toy distributions (bimodal, ring, 4-Gaussians, 8-Gaussians, checkerboard), we measure the squared 2-Wasserstein distance $W_2^2$ between generated and target samples, the drift norm $\|V\|^2$ as a convergence diagnostic, and mode coverage (number of modes captured).
+On MNIST in a 6-dimensional autoencoder latent space, we report per-class EMD and classification accuracy, following the protocol of~\cite{he2026sinkhorn}.
+If compute allows, we evaluate on FFHQ-ALAE with FID and latent EMD.
+
+\textbf{Qualitative analysis.}
+We visualize the learned convex potential $\psi_\omega$ and its gradient field to verify that the transport map is geometrically sensible.
+We plot drift trajectories to compare the smoothness of ICNN-based paths versus kernel-based paths, and examine behavior across a sweep of Sinkhorn regularization strengths.
+
+\textbf{Ablations.}
+We ablate the number of inner-loop steps $K$, the ICNN architecture (depth, width, strong convexity parameter $\mu$), the Sinkhorn regularization $\varepsilon$, and the effect of warm-starting the ICNN across outer iterations.
+
+\textbf{Baselines.}
+We compare against (i) the original kernel-based drift~\cite{deng2026drifting}, (ii) Sinkhorn drifting~\cite{he2026sinkhorn}, and (iii) a direct Sinkhorn displacement baseline (no ICNN regression, using $V_i = \bar{y}_i - x_i$ directly) to isolate the contribution of the ICNN parameterization.
+
+
+\subsection{Experiments and Timeline}
+
+\textbf{Weeks 1--2: Proof-of-concept on 2D distributions.}
+Implement the ICNN drift field in PyTorch and validate on bimodal, ring, and multi-Gaussian targets.
+Compare convergence curves ($\|V\|^2$ and $W_2^2$) against kernel and Sinkhorn baselines.
+We have a working prototype (preliminary code attached) that already demonstrates the three methods on 2D distributions; the first milestone is to produce publication-quality comparisons and ablations.
+
+\textbf{Weeks 3--4: Mid-term report and scaling to MNIST.}
+Train a convolutional autoencoder on MNIST and run the ICNN drifting generator in the 6D latent space.
+Reproduce the temperature-sweep experiment from~\cite{he2026sinkhorn} to verify that ICNN drifting maintains class coverage across all $\tau$ values (or, equivalently, across a range of Sinkhorn regularization strengths, since $\tau$ is no longer a hyperparameter of the drift itself).
+Deliver mid-term progress report.
+
+\textbf{Weeks 5--6: Scaling and final evaluation.}
+Attempt latent-space generation on FFHQ using a pretrained ALAE decoder.
+Conduct thorough ablation studies (ICNN depth, inner steps, warm-starting).
+Prepare final report with complete theoretical discussion and experimental results. Moreover, evaluate the ICNN drift field on CIFAR-10 ($32{\times}32$) and CelebA ($64{\times}64$) in the latent space of a pretrained VAE, where the ambient dimension ($d{=}256$ or $d{=}512$) begins to challenge both the ICNN approximation capacity and the Sinkhorn inner loop.
+Report FID, latent $W_2^2$, and wall-clock time per training step to quantify whether the amortization benefit of the ICNN compensates for its inner-loop overhead at scale.
+
+\section{Related Work}
+
+\textbf{Drifting and Sinkhorn-drifting models.}
+\citet{Deng et al.}{deng2026drifting} introduced the drifting paradigm, achieving state-of-the-art one-step generation on ImageNet.
+\citet{He et al.}{he2026sinkhorn} established the connection to Sinkhorn divergence gradient flows, showing that the original drift is a single Sinkhorn iteration and that full Sinkhorn normalization resolves temperature sensitivity and improves identifiability.
+Our work builds on both: we preserve the cross-minus-self structure but replace the coupling-based drift with a parametric OT map.
+
+\textbf{Neural optimal transport.}
+\citet{Makkuva et al.}{makkuva2020optimal} first proposed using ICNNs to learn optimal transport maps via a minimax formulation of the Kantorovich dual.
+\citet{Korotin et al.}{korotin2022neural} extended this to large-scale problems with a saddle-point objective.
+\citet{Bunne et al.}{bunne2022supervised} trained conditional Monge maps for single-cell perturbation prediction.
+We adapt the ICNN transport map idea to the drifting generative modeling setting, where the inner-loop ICNN regression provides the drift field for outer-loop generator training.
+
+\textbf{OT-guided flow matching.}
+\citet{Pooladian et al.}{pooladian2023multisample} and \citet{Tong et al.}{tong2024improving} use minibatch optimal transport couplings to straighten flow-matching trajectories, reducing the number of inference steps.
+Our approach differs in that we use OT to define a training-time drift field for a one-step generator, rather than to couple source-target pairs for a multi-step flow.
+
+\textbf{Wasserstein gradient flows.}
+\citet{Fan et al.}{fan2022variational} parameterize Wasserstein gradient flows using ICNNs for density estimation.
+\citet{Alvarez-Melis et al.}{alvarez2022optimizing} optimize functionals over probability spaces with ICNN-based pushforward maps.
+Our work can be seen as implementing a single Wasserstein gradient flow step per training iteration, where the ICNN provides the flow map.
+
+\textbf{MMD and kernel methods.}
+Generative moment matching networks~\cite{li2015generative} and OT-based GAN losses~\cite{salimans2018improving,genevay2018learning} are precursors to the drifting framework.
+The key difference, as noted in~\cite{deng2026drifting}, is that drifting uses normalized kernels, breaking the MMD gradient flow interpretation but enabling better empirical performance.
+
+
+\section{Discussion}
+
+\subsection{Implications and Contribution}
+
+If successful, this project would demonstrate that ICNN-based drift fields provide a principled, temperature-free alternative to kernel-based drifting with stronger theoretical guarantees.
+The amortization of transport computation into a smooth neural network potential could enable better scaling to high-dimensional latent spaces, where pairwise kernel computations become unreliable due to the curse of dimensionality.
+More broadly, this work would strengthen the connection between drifting generative models and the rich theory of optimal transport, opening the door to leveraging decades of OT theory (regularity, stability, statistical rates) for generative modeling.
+
+
+\subsection{Feasibility and Risk Assessment}
+
+\textbf{Data.}
+We use standard benchmarks (2D synthetic distributions, MNIST, FFHQ) that are publicly available and well-understood.
+
+\textbf{Compute.}
+The 2D and MNIST experiments require only a single GPU and can be completed in hours.
+FFHQ experiments in latent space are also moderate (3-layer MLP generator, pretrained ALAE decoder).
+% We have access to a single A100 GPU, which is sufficient for all proposed experiments.
+
+\textbf{Software.}
+Our prototype is implemented in PyTorch and is self-contained.
+We use standard libraries (torch, numpy, matplotlib) with no external simulator dependencies.
+
+\textbf{Risks and mitigation.}
+
+The primary risk is that the ICNN inner loop may be too slow or may not converge well within a small number of steps, degrading the quality of the drift field.
+We mitigate this by (i) warm-starting the ICNN across outer iterations so that each inner loop starts from a good initialization, (ii) comparing against a ``direct OT displacement'' baseline that bypasses the ICNN entirely (using $V_i = \bar{y}_i - x_i$) to isolate the ICNN's contribution, and (iii) experimenting with the number of inner steps $K$ to find the efficiency--quality trade-off.
+
+A secondary risk is that the ICNN may lack the capacity to represent complex OT maps in high dimensions.
+We address this by using architectures validated in prior neural OT work~\cite{makkuva2020optimal,korotin2022neural} and by operating in moderate-dimensional latent spaces (6D for MNIST, 512D for FFHQ) where ICNN approximation quality has been empirically demonstrated.
+
+
+\bibliographystyle{IEEEtran}
+\bibliography{literature}
+
+\end{document}

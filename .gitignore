@@ -3,3 +3,10 @@
 /results
 *.png
 /data
+/logs
+/checkpoints
+__pycache__
+*.pyc
+*.pkl
+*.pt
+*.pth
