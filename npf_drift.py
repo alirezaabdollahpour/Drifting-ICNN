@@ -289,10 +289,13 @@ class NPFInputConvexPotential(nn.Module):
         elu_alpha: float = 1.0,
         softplus_beta: float = 1.0,
         init_eps: float = 1e-2,
+        outer_delta_init: float = 1.0,
     ):
         super().__init__()
         if len(hidden_sizes) < 1:
             raise ValueError("NPFInputConvexPotential needs at least 1 hidden layer.")
+        if outer_delta_init <= 0.0:
+            raise ValueError(f"outer_delta_init must be > 0; got {outer_delta_init}.")
         self.input_dim = int(input_dim)
         self.hidden_sizes = [int(h) for h in hidden_sizes]
         self.outer_rank = int(outer_rank)
@@ -301,9 +304,10 @@ class NPFInputConvexPotential(nn.Module):
         self.elu_alpha = float(elu_alpha)
         self.softplus_beta = float(softplus_beta)
         self.init_eps = float(init_eps)
+        self.outer_delta_init = float(outer_delta_init)
 
         self.outer_delta_raw = nn.Parameter(
-            torch.full((self.input_dim,), _npf_softplus_inverse(1.0))
+            torch.full((self.input_dim,), _npf_softplus_inverse(self.outer_delta_init))
         )
         if self.outer_rank > 0:
             if self.init_eps > 0.0:
@@ -378,12 +382,22 @@ class NPFInputConvexPotential(nn.Module):
         lies in a near-rank-1 subspace, and Adam stalls in the affine
         basin. The O(eps) Gaussian preserves T(x)≈x to O(eps) but breaks
         the symmetry the inner loop needs.
+
+        Cascade-output shrink (w_linears, w_out): without this, the
+        LogNormal init makes ψ_cascade an O(1) constant offset on top of
+        ψ_outer at t=0. The gradient w.r.t. z is still O(eps) (because
+        b_l and q_l are O(eps)), but Adam spends its first hundreds of
+        outer steps cancelling that constant before the cascade can
+        carry useful curvature. Shrinking the non-negative weights
+        log-scale to log(eps/√fan_in) makes ψ_cascade itself O(eps) at
+        init while leaving the cascade fully connected (gradients flow
+        on the first inner step).
         """
         eps = self.init_eps
         delta_raw_init = _npf_softplus_inverse(eps) if eps > 0.0 else -1e3
         d = self.input_dim
         with torch.no_grad():
-            self.outer_delta_raw.fill_(_npf_softplus_inverse(1.0))
+            self.outer_delta_raw.fill_(_npf_softplus_inverse(self.outer_delta_init))
             if self.outer_A is not None:
                 if eps > 0.0:
                     std = eps / math.sqrt(max(self.outer_rank * self.input_dim, 1))
@@ -406,6 +420,21 @@ class NPFInputConvexPotential(nn.Module):
                         q.A.normal_(0.0, std)
                     else:
                         q.A.zero_()
+            # Shrink hidden-to-hidden cascade weights so each layer's
+            # contribution to ψ-value is O(eps), not O(1) (Bug 4 fix).
+            # The non-negative parameterisation is W = exp(weight_param),
+            # so weight_param = log(target_W) gives W = target_W exactly.
+            for wl in self.w_linears:
+                if wl is None:
+                    continue
+                fan_in = wl.in_features
+                if eps > 0.0:
+                    target_w = eps / math.sqrt(max(fan_in, 1))
+                    wl.weight_param.fill_(math.log(target_w))
+                else:
+                    wl.weight_param.fill_(-1e3)
+                if wl.bias is not None:
+                    wl.bias.zero_()
             self.q_out.delta_raw.fill_(delta_raw_init)
             if self.q_out.A is not None:
                 if eps > 0.0:
@@ -413,6 +442,15 @@ class NPFInputConvexPotential(nn.Module):
                     self.q_out.A.normal_(0.0, std)
                 else:
                     self.q_out.A.zero_()
+            # Same shrink for the output non-negative projection.
+            fan_in_out = self.w_out.in_features
+            if eps > 0.0:
+                target_w_out = eps / math.sqrt(max(fan_in_out, 1))
+                self.w_out.weight_param.fill_(math.log(target_w_out))
+            else:
+                self.w_out.weight_param.fill_(-1e3)
+            if self.w_out.bias is not None:
+                self.w_out.bias.zero_()
             if eps > 0.0:
                 self.b_out.weight.normal_(0.0, eps / math.sqrt(d))
             else:
@@ -580,17 +618,34 @@ class NPFInputConvexPotential(nn.Module):
 class NPFDriftField:
     """V(x) = ∇ψ_ω(x) - x using the NPF input convex potential.
 
-    Inner-loop optimizer is Adam, regressing T_ω(x) against a Sinkhorn
-    barycentric target. The Sinkhorn computation is supplied by the caller
-    via `sinkhorn_target_fn(x, y) -> y_target`; if omitted, defaults to
-    `barycentric_target_simple(x, y, reg=sinkhorn_reg, num_iters=...)`.
+    Inner-loop objective (selected via `inner_objective`):
 
-    Two init modes:
+      * "regression" (legacy default) — fit T_ω(x) by Adam against a
+        Sinkhorn barycentric target ȳ. Cheap but inherits the high-reg
+        barycentric collapse pathology: when reg is large, ȳ ≈ E[y]
+        for every x and ψ learns the trivial "push everything to the
+        mean" map.
+
+      * "semi_dual" — Makkuva-Taghvaei-Lee-Oh (2020) min-max objective
+        with an auxiliary ICNN `φ` parameterising the conjugate ψ*.
+        Loss V(ψ, φ) = E_y[<y, ∇φ(y)> - ψ(∇φ(y))] - E_x[ψ(x)],
+        minimised over ψ and maximised over φ. This is the standard
+        W2GN setup (Korotin et al., 2019) and avoids any Sinkhorn
+        smoothing. T = ∇ψ recovers the Brenier map μ → ν.
+
+    Two init modes (independent of inner_objective):
         * "identity"  — ∇ψ(z) ≈ z at t=0 (default).
         * "gaussian"  — on the first compute_V call, sets ∇ψ(z) to the
                         closed-form Brenier map between Gaussian
                         approximations of (x, y), blended with identity
                         via init_blend.
+
+    Adam state across outer batches:
+        * `reset_inner_optimizer=True` (default for semi_dual; safer for
+           regression too) — fresh Adam state at the top of every inner
+           loop. Avoids carrying batch-t's momentum into batch-t+1's
+           regression problem (the inner objective changes every batch,
+           so persisted momentum points the wrong way).
 
     Convexity is preserved automatically because non-negative weights are
     parameterized as exp(·); no post-step projection is required.
@@ -606,26 +661,46 @@ class NPFDriftField:
         elu_alpha: float = 1.0,
         softplus_beta: float = 1.0,
         init_eps: float = 1e-2,
-        inner_steps: int = 15,
-        inner_lr: float = 3e-3,
+        outer_delta_init: float = 1.0,
+        inner_steps: int = 30,
+        inner_lr: float = 1e-2,
         adam_betas: Tuple[float, float] = (0.9, 0.999),
         adam_eps: float = 1e-8,
         weight_decay: float = 0.0,
         grad_clip: float = 5.0,
-        # Sinkhorn target
-        sinkhorn_reg: float = 0.05,
-        sinkhorn_iters: int = 100,
+        # Sinkhorn target (only used by inner_objective="regression")
+        sinkhorn_reg: float = 0.2,
+        sinkhorn_iters: int = 80,
         sinkhorn_target_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         # Init mode
         init_mode: str = "identity",
         init_blend: float = 1.0,
         gaussian_init_eps: float = 1e-4,
+        # Inner objective (regression vs Makkuva-style semi-dual)
+        inner_objective: str = "regression",
+        semi_dual_phi_steps: int = 1,
+        # W2GN cycle-consistency stabiliser for the semi-dual objective.
+        # Adds γ·(‖∇φ(∇ψ(x)) − x‖² + ‖∇ψ(∇φ(y)) − y‖²) which (i) is bounded
+        # below by 0 so ψ cannot run away to ±∞ to maximise the dual, and
+        # (ii) enforces ψ ≈ φ⁻¹ which is exactly the geometric requirement
+        # for the optimum of the dual. Set to 0.0 to recover the bare
+        # Makkuva min–max (unstable for the architecture in this repo).
+        cycle_weight: float = 0.0,
+        reset_inner_optimizer: bool = True,
         # Strong convexity is implicit in the outer δ; kept here for
         # API parity with the ICNN baseline. Currently unused.
         strong_convexity: float = 1.0,
     ):
         self.dim = int(dim)
         self.hidden_dims = list(hidden_dims)
+        self.outer_rank = int(outer_rank)
+        self.inner_rank = int(inner_rank)
+        self.activation = activation
+        self.elu_alpha = float(elu_alpha)
+        self.softplus_beta = float(softplus_beta)
+        self.init_eps = float(init_eps)
+        self.outer_delta_init = float(outer_delta_init)
+
         self.psi = NPFInputConvexPotential(
             input_dim=dim,
             hidden_sizes=self.hidden_dims,
@@ -635,6 +710,7 @@ class NPFDriftField:
             elu_alpha=elu_alpha,
             softplus_beta=softplus_beta,
             init_eps=init_eps,
+            outer_delta_init=outer_delta_init,
         )
         # Joint init: principled LogNormal draws come from the layer
         # constructors; identity init is applied on top. Gaussian init,
@@ -661,17 +737,49 @@ class NPFDriftField:
         self._did_gaussian_init = False
         self._last_gaussian_init_v_norm: Optional[float] = None
 
+        if inner_objective not in {"regression", "semi_dual"}:
+            raise ValueError(
+                f"inner_objective must be 'regression' or 'semi_dual'; got {inner_objective!r}"
+            )
+        self.inner_objective = inner_objective
+        self.semi_dual_phi_steps = max(1, int(semi_dual_phi_steps))
+        self.cycle_weight = float(cycle_weight)
+        self.reset_inner_optimizer = bool(reset_inner_optimizer)
+
         self.strong_convexity = float(strong_convexity)
 
-        self.optimizer = self._make_optimizer()
+        # Auxiliary conjugate-side ICNN φ for the semi-dual objective.
+        # Same architecture as ψ. Gradient ∇φ(y) approximates T⁻¹(y),
+        # i.e. the inverse Brenier map; at the optimum it equals
+        # (∇ψ)⁻¹ ∘ identity, and ψ ∘ ∇φ ≈ ψ ∘ ψ*-grad ≈ id.
+        if self.inner_objective == "semi_dual":
+            self.phi = NPFInputConvexPotential(
+                input_dim=dim,
+                hidden_sizes=self.hidden_dims,
+                outer_rank=outer_rank,
+                inner_rank=inner_rank,
+                activation=activation,
+                elu_alpha=elu_alpha,
+                softplus_beta=softplus_beta,
+                init_eps=init_eps,
+                outer_delta_init=outer_delta_init,
+            )
+            self.phi.init_as_identity()
+        else:
+            self.phi = None
+
+        self.optimizer = self._make_optimizer(self.psi)
+        self.phi_optimizer: Optional[optim.Optimizer] = (
+            self._make_optimizer(self.phi) if self.phi is not None else None
+        )
 
     # ------------------------------------------------------------------
     # Plumbing
     # ------------------------------------------------------------------
 
-    def _make_optimizer(self) -> optim.Optimizer:
+    def _make_optimizer(self, module: nn.Module) -> optim.Optimizer:
         return optim.Adam(
-            self.psi.parameters(),
+            module.parameters(),
             lr=self.inner_lr,
             betas=self.adam_betas,
             eps=self.adam_eps,
@@ -680,18 +788,27 @@ class NPFDriftField:
 
     def to(self, device) -> "NPFDriftField":
         self.psi = self.psi.to(device)
-        # Rebind the optimizer to device-resident parameters.
-        self.optimizer = self._make_optimizer()
+        if self.phi is not None:
+            self.phi = self.phi.to(device)
+        # Rebind optimizers to device-resident parameters.
+        self.optimizer = self._make_optimizer(self.psi)
+        if self.phi is not None:
+            self.phi_optimizer = self._make_optimizer(self.phi)
         return self
 
     def parameters(self):
-        return self.psi.parameters()
+        # Both ψ and φ are part of the inner problem; expose both so
+        # external callers (e.g. checkpointers) see all trainable state.
+        if self.phi is None:
+            return self.psi.parameters()
+        return list(self.psi.parameters()) + list(self.phi.parameters())
 
     def _sinkhorn_target(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         if self._user_sinkhorn_target_fn is not None:
             return self._user_sinkhorn_target_fn(x, y)
-        return barycentric_target_simple(
-            x, y, reg=self.sinkhorn_reg, num_iters=self.sinkhorn_iters
+        return barycentric_target_log(
+            x, y, reg=self.sinkhorn_reg, num_iters=self.sinkhorn_iters,
+            normalize_cost=True,
         )
 
     def _maybe_gaussian_init(self, x: torch.Tensor, y: torch.Tensor):
@@ -701,10 +818,22 @@ class NPFDriftField:
             x, y, blend=self.init_blend, eps=self.gaussian_init_eps
         )
         # Reset Adam state after manually changing parameters.
-        self.optimizer = self._make_optimizer()
+        self.optimizer = self._make_optimizer(self.psi)
+        if self.phi is not None:
+            # φ also gets the inverse affine warm-start so that ∇φ ∘ ∇ψ ≈ id
+            # at t=0; cheapest version is to set φ to the same affine — V
+            # at init is then 0, and the semi-dual gradients come from
+            # batch-level fluctuations on the first inner step.
+            self.phi.init_as_identity()
+            self.phi_optimizer = self._make_optimizer(self.phi)
         self._did_gaussian_init = True
         with torch.no_grad():
-            T0 = x @ A.T + b
+            eye = torch.eye(self.dim, device=x.device, dtype=x.dtype)
+            A_eff = (1.0 - self.init_blend) * eye + self.init_blend * A.to(
+                device=x.device, dtype=x.dtype
+            )
+            b_eff = self.init_blend * b.to(device=x.device, dtype=x.dtype)
+            T0 = x @ A_eff.T + b_eff
             self._last_gaussian_init_v_norm = float(((T0 - x) ** 2).mean().item())
         return A, b
 
@@ -712,9 +841,11 @@ class NPFDriftField:
     # Inner loop / drift
     # ------------------------------------------------------------------
 
-    def _inner_loop(self, x: torch.Tensor, y_target: torch.Tensor) -> Tuple[torch.Tensor, float]:
-        """Run `inner_steps` Adam steps, then return (V, last_inner_loss)."""
-        self.psi.train()
+    def _inner_loop_regression(self, x: torch.Tensor, y_target: torch.Tensor
+                               ) -> Tuple[torch.Tensor, float]:
+        """Run `inner_steps` Adam steps fitting T_ω(x) ≈ y_target."""
+        if self.reset_inner_optimizer:
+            self.optimizer = self._make_optimizer(self.psi)
         last_inner_loss = float("nan")
         for _ in range(self.inner_steps):
             self.optimizer.zero_grad(set_to_none=True)
@@ -725,30 +856,130 @@ class NPFDriftField:
             self.optimizer.step()
             last_inner_loss = float(loss.item())
 
-        self.psi.eval()
         T_x = self.psi.gradient(x, create_graph=False)
         V = (T_x.detach() - x).detach()
         return V, last_inner_loss
 
+    def _inner_loop_semi_dual(self, x: torch.Tensor, y: torch.Tensor
+                              ) -> Tuple[torch.Tensor, float]:
+        """Makkuva semi-dual + W2GN cycle-consistency: alternate φ-max / ψ-min.
+
+        V(ψ, φ) = E_y[<y, ∇φ(y)> - ψ(∇φ(y))] - E_x[ψ(x)]
+
+        With ``cycle_weight > 0`` the loss adds the W2GN regulariser
+
+            L_cycle = γ · (E_x‖∇φ(∇ψ(x)) − x‖² + E_y‖∇ψ(∇φ(y)) − y‖²),
+
+        which keeps ψ and φ as proper inverses of each other and makes the
+        bare semi-dual stable. The φ-step picks up the x-cycle (because φ
+        owns the inverse-of-ψ side); the ψ-step picks up the y-cycle.
+        Without this term, ψ can run away to ±∞ to maximise the dual
+        unboundedly — see the warning in the notebook for empirical
+        evidence of that failure mode.
+
+        ψ and φ are *separate* ICNNs, so each step has its own optimizer
+        and its own grad clip. Convexity of both is preserved by their
+        non-negative cascade parameterisation.
+        """
+        assert self.phi is not None and self.phi_optimizer is not None
+        if self.reset_inner_optimizer:
+            self.optimizer = self._make_optimizer(self.psi)
+            self.phi_optimizer = self._make_optimizer(self.phi)
+        last_psi_loss = float("nan")
+        cycle_weight = self.cycle_weight
+
+        for _ in range(self.inner_steps):
+            # ---- φ-step: maximise V over φ-parameters with ψ fixed.
+            #
+            # Differentiating <y, ∇φ(y)> - ψ(∇φ(y)) w.r.t. φ-parameters
+            # requires create_graph=True on the φ-gradient. We freeze
+            # ψ-params for the duration so backward through ψ does not
+            # build the parameter-side of ψ's graph (saves memory and
+            # avoids touching ψ.grad with stale values).
+            for p in self.psi.parameters():
+                p.requires_grad_(False)
+            try:
+                for _ in range(self.semi_dual_phi_steps):
+                    self.phi_optimizer.zero_grad(set_to_none=True)
+                    T_phi_y = self.phi.gradient(y, create_graph=True)
+                    inner_prod = (T_phi_y * y).sum(dim=-1)
+                    psi_at_T = self.psi(T_phi_y)
+                    # max V_φ = <y, ∇φ(y)> - ψ(∇φ(y))  →  min negation.
+                    phi_loss = -(inner_prod - psi_at_T).mean()
+
+                    if cycle_weight > 0.0:
+                        # x-cycle: φ should invert ψ on x ∼ μ.
+                        # ψ is frozen so ∇ψ(x) is a pure tensor (no
+                        # parameter-side autograd dependency); detach is
+                        # technically redundant but kept for clarity.
+                        T_psi_x = self.psi.gradient(x, create_graph=False).detach()
+                        T_phi_T_psi_x = self.phi.gradient(T_psi_x, create_graph=True)
+                        cycle_x = (T_phi_T_psi_x - x).pow(2).mean()
+                        phi_loss = phi_loss + cycle_weight * cycle_x
+
+                    phi_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.phi.parameters(), self.grad_clip)
+                    self.phi_optimizer.step()
+            finally:
+                for p in self.psi.parameters():
+                    p.requires_grad_(True)
+
+            # ---- ψ-step: minimise V over ψ-parameters with φ fixed.
+            #
+            # E_y[ψ(∇φ(y))] - E_x[ψ(x)]  is linear in ψ-params (ψ is
+            # affine in its own parameters along any fixed input).
+            # Gradient flow into φ is killed by detaching ∇φ(y).
+            self.optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                T_phi_y_det = self.phi.gradient(y, create_graph=False).detach()
+            psi_loss = self.psi(T_phi_y_det).mean() - self.psi(x).mean()
+
+            if cycle_weight > 0.0:
+                # y-cycle: ψ should invert φ on y ∼ ν. T_phi_y_det is
+                # already detached so no φ-graph leakage; create_graph
+                # on the ψ-side gives us the second-derivative pathway
+                # we need to pull this loss into ψ-params.
+                T_psi_T_phi_y = self.psi.gradient(T_phi_y_det, create_graph=True)
+                cycle_y = (T_psi_T_phi_y - y).pow(2).mean()
+                psi_loss = psi_loss + cycle_weight * cycle_y
+
+            psi_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.psi.parameters(), self.grad_clip)
+            self.optimizer.step()
+            last_psi_loss = float(psi_loss.item())
+
+        T_x = self.psi.gradient(x, create_graph=False)
+        V = (T_x.detach() - x).detach()
+        return V, last_psi_loss
+
     def compute_V(self, x_gen: torch.Tensor, y_pos: torch.Tensor) -> torch.Tensor:
-        """Drift V = ∇ψ(x) - x after `inner_steps` Adam updates on ψ."""
+        """Drift V = ∇ψ(x) - x after `inner_steps` updates on ψ (and φ)."""
         x = x_gen.detach()
         y = y_pos.detach()
         self._maybe_gaussian_init(x, y)
-        with torch.no_grad():
-            y_target = self._sinkhorn_target(x, y)
-        V, _ = self._inner_loop(x, y_target)
+        if self.inner_objective == "semi_dual":
+            V, _ = self._inner_loop_semi_dual(x, y)
+        else:
+            with torch.no_grad():
+                y_target = self._sinkhorn_target(x, y)
+            V, _ = self._inner_loop_regression(x, y_target)
         return V
 
     def compute_V_with_stats(self, x_gen: torch.Tensor, y_pos: torch.Tensor
                              ) -> Tuple[torch.Tensor, dict]:
         """Same as compute_V but returns (V, stats) for ablations.
 
-        stats keys:
-            inner_loss             — last inner-step regression loss
-            target_v_norm          — ||ȳ - x||² (direct OT displacement norm)
-            fit_ratio              — ||V||² / target_v_norm
-            gaussian_init_v_norm   — affine init drift norm (or None)
+        stats keys (always present, may be NaN if not applicable):
+            inner_loss             — last inner-step loss (regression L²
+                                      for "regression"; ψ-loss V for
+                                      "semi_dual", which can be < 0).
+            target_v_norm          — ||ȳ - x||² (Sinkhorn ref). Computed
+                                      for both objectives as a diagnostic.
+            fit_ratio              — ||V||² / target_v_norm. With
+                                      "semi_dual", this is a *comparison*
+                                      to the Sinkhorn reference, not the
+                                      actual training target.
+            gaussian_init_v_norm   — affine init drift norm (or None).
         """
         x = x_gen.detach()
         y = y_pos.detach()
@@ -756,13 +987,17 @@ class NPFDriftField:
         with torch.no_grad():
             y_target = self._sinkhorn_target(x, y)
             target_v_norm = float(((y_target - x) ** 2).mean().item())
-        V, last_inner_loss = self._inner_loop(x, y_target)
+        if self.inner_objective == "semi_dual":
+            V, last_inner_loss = self._inner_loop_semi_dual(x, y)
+        else:
+            V, last_inner_loss = self._inner_loop_regression(x, y_target)
         v_norm = float((V ** 2).mean().item())
         stats = {
             "inner_loss": last_inner_loss,
             "target_v_norm": target_v_norm,
             "fit_ratio": v_norm / (target_v_norm + 1e-8),
             "gaussian_init_v_norm": self._last_gaussian_init_v_norm,
+            "objective": self.inner_objective,
         }
         return V, stats
 
