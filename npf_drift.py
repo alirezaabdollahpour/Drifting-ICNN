@@ -1,11 +1,6 @@
 """NPF (Vesseron & Cuturi, 2024) ICNN potential + drift field.
 
-Standalone module shared by:
-  * Drifting_ICNN_MNIST_fixed.ipynb
-  * Drifting_ICNN_full_gaussian_init_sinkhorn_ablation.ipynb
-  * Drifting_ICNN_width_depth_ablation.ipynb
 
-Public surface
 --------------
 NPFInputConvexPotential
     The convex potential ψ_ω(z): PSD outer base (diag + low-rank) + deep
@@ -42,6 +37,8 @@ Architecture helpers
 Gaussian-OT helpers
     gaussian_ot_affine_map, sample_mean_cov, psd_matrix_power
 """
+
+
 from __future__ import annotations
 
 import math
